@@ -9,7 +9,9 @@ def _now():
 
 
 async def init_db():
+    """Создаёт все таблицы при первом запуске"""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Таблица сотрудников
         await db.execute(f"""
             CREATE TABLE IF NOT EXISTS employees (
                 telegram_id INTEGER PRIMARY KEY,
@@ -19,6 +21,8 @@ async def init_db():
                 approved INTEGER DEFAULT 0
             )
         """)
+        
+        # Таблица смен
         await db.execute(f"""
             CREATE TABLE IF NOT EXISTS shifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,6 +33,8 @@ async def init_db():
                 photo_close_id TEXT
             )
         """)
+        
+        # Таблица перерывов
         await db.execute(f"""
             CREATE TABLE IF NOT EXISTS breaks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,9 +44,10 @@ async def init_db():
                 photo_id TEXT
             )
         """)
+        
         await db.commit()
 
-        # Миграции
+        # Миграции для старых БД (если таблицы уже были)
         for col in ["closed_at", "photo_open_id", "photo_close_id"]:
             try:
                 await db.execute(f"ALTER TABLE shifts ADD COLUMN {col} TEXT")
@@ -49,9 +56,10 @@ async def init_db():
                 pass
 
 
-# ---------- Employees ----------
+# ========== РАБОТА С СОТРУДНИКАМИ ==========
 
 async def get_employee(telegram_id: int):
+    """Получить сотрудника по Telegram ID"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM employees WHERE telegram_id = ?", (telegram_id,)) as cur:
@@ -59,6 +67,7 @@ async def get_employee(telegram_id: int):
 
 
 async def get_employee_by_name(full_name: str):
+    """Получить сотрудника по полному имени"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM employees WHERE full_name = ?", (full_name,)) as cur:
@@ -66,6 +75,7 @@ async def get_employee_by_name(full_name: str):
 
 
 async def register_employee(telegram_id: int, full_name: str, wb_id: str):
+    """Зарегистрировать нового сотрудника (статус approved = 0)"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO employees (telegram_id, full_name, wb_employee_id, approved) VALUES (?, ?, ?, 0)",
@@ -75,18 +85,21 @@ async def register_employee(telegram_id: int, full_name: str, wb_id: str):
 
 
 async def approve_employee(telegram_id: int):
+    """Одобрить сотрудника"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE employees SET approved = 1 WHERE telegram_id = ?", (telegram_id,))
         await db.commit()
 
 
 async def delete_employee(telegram_id: int):
+    """Удалить сотрудника"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM employees WHERE telegram_id = ?", (telegram_id,))
         await db.commit()
 
 
 async def get_all_employees():
+    """Получить всех сотрудников (сортировка по дате регистрации)"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM employees ORDER BY registered_at DESC") as cur:
@@ -94,15 +107,17 @@ async def get_all_employees():
 
 
 async def get_approved_employees():
+    """Получить только одобренных сотрудников (сортировка по имени)"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM employees WHERE approved = 1 ORDER BY full_name") as cur:
             return await cur.fetchall()
 
 
-# ---------- Shifts ----------
+# ========== РАБОТА СО СМЕНАМИ ==========
 
 async def open_shift(telegram_id: int, photo_id: str):
+    """Открыть новую смену"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO shifts (telegram_id, photo_open_id) VALUES (?, ?)",
@@ -112,6 +127,7 @@ async def open_shift(telegram_id: int, photo_id: str):
 
 
 async def get_active_shift(telegram_id: int):
+    """Получить активную (незакрытую) смену сотрудника"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -122,6 +138,7 @@ async def get_active_shift(telegram_id: int):
 
 
 async def close_shift(shift_id: int, photo_id: str):
+    """Закрыть смену"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE shifts SET closed_at = datetime('now', '+3 hours'), photo_close_id = ? WHERE id = ?",
@@ -131,6 +148,7 @@ async def close_shift(shift_id: int, photo_id: str):
 
 
 async def get_shifts_this_week(telegram_id: int):
+    """Получить все смены сотрудника за текущую неделю (с понедельника)"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
@@ -143,6 +161,7 @@ async def get_shifts_this_week(telegram_id: int):
 
 
 async def count_active_shifts():
+    """Посчитать количество активных смен у всех сотрудников"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*) FROM shifts WHERE closed_at IS NULL") as cur:
             row = await cur.fetchone()
@@ -150,6 +169,7 @@ async def count_active_shifts():
 
 
 async def get_all_active_shifts():
+    """Получить все активные смены с именами сотрудников"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
@@ -162,9 +182,10 @@ async def get_all_active_shifts():
             return await cur.fetchall()
 
 
-# ---------- Breaks ----------
+# ========== РАБОТА С ПЕРЕРЫВАМИ ==========
 
 async def start_break(telegram_id: int, photo_id: str):
+    """Начать перерыв"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO breaks (telegram_id, photo_id) VALUES (?, ?)",
@@ -174,6 +195,7 @@ async def start_break(telegram_id: int, photo_id: str):
 
 
 async def get_active_break(telegram_id: int):
+    """Получить активный (незавершённый) перерыв сотрудника"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -184,6 +206,7 @@ async def get_active_break(telegram_id: int):
 
 
 async def end_break(break_id: int):
+    """Завершить перерыв"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE breaks SET ended_at = datetime('now', '+3 hours') WHERE id = ?",
@@ -193,6 +216,7 @@ async def end_break(break_id: int):
 
 
 async def get_breaks_for_week(telegram_id: int):
+    """Получить все перерывы сотрудника за текущую неделю (с понедельника)"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
