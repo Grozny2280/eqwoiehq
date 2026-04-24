@@ -12,21 +12,39 @@ ALL_ADMINS = list(set(ADMIN_IDS + SUPERADMIN_IDS))
 MSK = timezone(timedelta(hours=3))
 
 # Состояния пользователей (временные)
-user_state = {}  # {user_id: "waiting_name" / "waiting_wb" / "waiting_open" / "waiting_close" / "waiting_break"}
+user_state = {}  # {user_id: "waiting_name" / "waiting_wb:name" / "waiting_open" / "waiting_close" / "waiting_break" / "stats_select"}
 
-# ---------- Клавиатуры ----------
+# Кеш состояний для клавиатуры (обновляется при каждом действии)
+shift_cache = {}  # {user_id: {"shift_active": bool, "break_active": bool}}
+break_cache = {}
 
-def get_keyboard(uid: int):
-    """Динамическая клавиатура в зависимости от состояния"""
-    shift = asyncio.run_coroutine_threadsafe(db.get_active_shift(uid), asyncio.get_event_loop()).result()
-    break_active = asyncio.run_coroutine_threadsafe(db.get_active_break(uid), asyncio.get_event_loop()).result()
-    
+
+async def update_user_cache(uid: int):
+    """Обновить кеш состояния пользователя"""
+    shift = await db.get_active_shift(uid)
+    break_active = await db.get_active_break(uid)
+    shift_cache[uid] = {
+        "shift_active": shift is not None,
+        "break_active": break_active is not None,
+        "shift_opened_at": shift["opened_at"] if shift else None
+    }
+
+
+def get_keyboard(uid: int, shift_active: bool = None, break_active: bool = None):
+    """Синхронная клавиатура — данные передаются извне"""
     is_sa = uid in SUPERADMIN_IDS
     is_adm = uid in ALL_ADMINS
     
+    # Если состояние не передано, берём из кеша
+    if shift_active is None:
+        cached = shift_cache.get(uid, {})
+        shift_active = cached.get("shift_active", False)
+        break_active = cached.get("break_active", False)
+    
     keyboard = []
     
-    if not shift:
+    # Основные кнопки сотрудника
+    if not shift_active:
         keyboard.append([KeyboardButton(text="🟢 Открыть смену")])
     else:
         if not break_active:
@@ -35,6 +53,7 @@ def get_keyboard(uid: int):
             keyboard.append([KeyboardButton(text="✅ Закончить перерыв")])
         keyboard.append([KeyboardButton(text="🔴 Закрыть смену")])
     
+    # Кнопки админа
     if is_sa or is_adm:
         keyboard.append([KeyboardButton(text="👥 Сотрудники"), KeyboardButton(text="📊 Статистика")])
         keyboard.append([KeyboardButton(text="🟢 Активные")])
@@ -99,6 +118,7 @@ async def send_to_chat(bot: Bot, text: str, photo_id: str = None):
 async def cmd_start(message: Message):
     uid = message.from_user.id
     emp = await db.get_employee(uid)
+    await update_user_cache(uid)
     
     # Суперадмин без регистрации
     if uid in SUPERADMIN_IDS and not emp:
@@ -133,20 +153,21 @@ async def cmd_help(message: Message):
 📋 *Помощь*
 
 👤 *Сотрудник:*
-🟢 Открыть смену
-☕ Перерыв
-✅ Закончить перерыв
-🔴 Закрыть смену
+🟢 Открыть смену — начало работы (нужно фото)
+☕ Перерыв — начало перерыва (нужно фото)
+✅ Закончить перерыв — завершение
+🔴 Закрыть смену — конец работы (нужно фото)
 
 👑 *Админ:*
-👥 Сотрудники — список
-📊 Статистика — отчёт
-🟢 Активные — кто на смене
+👥 Сотрудники — список всех
+📊 Статистика — отчёт по сотруднику
+🟢 Активные — кто сейчас на смене
 
 ⌨️ *Команды:*
 /start — главное меню
 /help — эта справка
 /active — кто на смене
+/chatid — ID текущего чата
 """
     await message.answer(text, parse_mode="Markdown")
 
@@ -171,6 +192,11 @@ async def cmd_active(message: Message):
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
+@router.message(Command("chatid"))
+async def cmd_chatid(message: Message):
+    await message.answer(f"Chat ID: `{message.chat.id}`", parse_mode="Markdown")
+
+
 # ---------- Отмена ----------
 
 @router.message(F.text == "❌ Отмена")
@@ -178,6 +204,7 @@ async def cancel(message: Message):
     uid = message.from_user.id
     if uid in user_state:
         del user_state[uid]
+    await update_user_cache(uid)
     await message.answer("❌ Отменено", reply_markup=get_keyboard(uid))
 
 
@@ -205,6 +232,7 @@ async def reg_wb(message: Message):
     # Автоодобрение для админов
     if uid in SUPERADMIN_IDS or uid in ALL_ADMINS:
         await db.approve_employee(uid)
+        await update_user_cache(uid)
         await message.answer(f"✅ Добро пожаловать, {name}!", reply_markup=get_keyboard(uid))
     else:
         await message.answer("✅ Заявка отправлена! Ожидайте одобрения.")
@@ -245,9 +273,9 @@ async def open_shift_photo(message: Message, bot: Bot):
     
     await db.open_shift(uid, photo_id)
     del user_state[uid]
+    await update_user_cache(uid)
     
     await message.answer(f"✅ Смена открыта в {now_str()}!\nХорошей работы, {emp['full_name']}!", reply_markup=get_keyboard(uid))
-    
     await notify_admins(bot, f"🟢 Смена открыта\n👤 {emp['full_name']}\n📍 {PVZ_ADDRESS}\n🕐 {now_str()}", photo_id)
 
 
@@ -282,6 +310,7 @@ async def start_break_photo(message: Message, bot: Bot):
     
     await db.start_break(uid, photo_id)
     del user_state[uid]
+    await update_user_cache(uid)
     
     await message.answer(f"☕ Перерыв начат в {now_str()}.\nНажмите «✅ Закончить перерыв» когда вернётесь.", reply_markup=get_keyboard(uid))
     await notify_admins(bot, f"☕ Перерыв начат\n👤 {emp['full_name']}\n📍 {PVZ_ADDRESS}\n🕐 {now_str()}", photo_id)
@@ -305,6 +334,7 @@ async def end_break(message: Message, bot: Bot):
     
     emp = await db.get_employee(uid)
     await db.end_break(active["id"])
+    await update_user_cache(uid)
     
     start_str = active["started_at"]
     end_str = now_db()
@@ -358,6 +388,7 @@ async def close_shift_photo(message: Message, bot: Bot):
     
     await db.close_shift(active["id"], photo_id)
     del user_state[uid]
+    await update_user_cache(uid)
     
     open_str = active["opened_at"]
     close_str = now_db()
@@ -420,7 +451,8 @@ async def send_weekly_report(bot: Bot):
 
 @router.message(F.text == "👥 Сотрудники")
 async def list_employees(message: Message):
-    if message.from_user.id not in ALL_ADMINS:
+    uid = message.from_user.id
+    if uid not in ALL_ADMINS:
         await message.answer("❗ Нет доступа")
         return
     
@@ -444,7 +476,8 @@ async def active_shifts(message: Message):
 
 @router.message(F.text == "📊 Статистика")
 async def stats_menu(message: Message):
-    if message.from_user.id not in ALL_ADMINS:
+    uid = message.from_user.id
+    if uid not in ALL_ADMINS:
         await message.answer("❗ Нет доступа")
         return
     
@@ -459,7 +492,7 @@ async def stats_menu(message: Message):
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    user_state[message.from_user.id] = "stats_select"
+    user_state[uid] = "stats_select"
     await message.answer("Выберите сотрудника:", reply_markup=kb)
 
 
@@ -470,6 +503,7 @@ async def stats_show(message: Message):
     
     if name == "❌ Отмена":
         del user_state[uid]
+        await update_user_cache(uid)
         await message.answer("Отменено", reply_markup=get_keyboard(uid))
         return
     
@@ -505,11 +539,5 @@ async def stats_show(message: Message):
     await message.answer(text, parse_mode="Markdown")
     
     del user_state[uid]
+    await update_user_cache(uid)
     await message.answer("Меню:", reply_markup=get_keyboard(uid))
-
-
-# ---------- /chatid ----------
-
-@router.message(Command("chatid"))
-async def chatid(message: Message):
-    await message.answer(f"Chat ID: `{message.chat.id}`", parse_mode="Markdown")
