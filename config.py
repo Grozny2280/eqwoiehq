@@ -1,4 +1,4 @@
-BOT_TOKEN = "8785991635:AAGuTEE4ev17ZDXqQLXwqvRxx0hX1TpwHdk"
+BOT_TOKEN = "8632454570:AAH4aAVfRVQ_MxXzprARaKzCgfIiF_5g4CE"
 
 # Админы (получают уведомления)
 ADMIN_IDS = [5239329589]
