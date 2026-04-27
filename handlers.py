@@ -734,7 +734,7 @@ async def edit_employee_delete_cancel(message: Message):
     await message.answer("❌ Удаление отменено", reply_markup=admin_panel_kb())
 
 
-# ---------- Редактирование смены (ИСПРАВЛЕНО) ----------
+# ========== РЕДАКТИРОВАНИЕ СМЕНЫ (ПОЛНОСТЬЮ ПЕРЕПИСАНО) ==========
 
 @router.message(F.text == "⏰ Редактировать смену")
 async def edit_shift_start(message: Message):
@@ -748,17 +748,19 @@ async def edit_shift_start(message: Message):
         await message.answer("Нет одобренных сотрудников")
         return
     
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=emp["full_name"])] for emp in employees] + [[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    # Простая клавиатура со списком сотрудников
+    kb_buttons = []
+    for emp in employees:
+        kb_buttons.append([KeyboardButton(text=emp["full_name"])])
+    kb_buttons.append([KeyboardButton(text="🔙 Назад"])
+    
+    kb = ReplyKeyboardMarkup(keyboard=kb_buttons, resize_keyboard=True)
     user_state[uid] = "edit_shift_select_employee"
-    await message.answer("👥 Выберите сотрудника, чью смену хотите отредактировать:", reply_markup=kb)
+    await message.answer("👥 Выберите сотрудника:", reply_markup=kb)
 
 
 @router.message(lambda m: user_state.get(m.from_user.id) == "edit_shift_select_employee")
-async def edit_shift_select_shift(message: Message):
+async def edit_shift_list_shifts(message: Message):
     uid = message.from_user.id
     name = message.text.strip()
     
@@ -769,59 +771,68 @@ async def edit_shift_select_shift(message: Message):
     
     emp = await db.get_employee_by_name(name)
     if not emp:
-        await message.answer("Сотрудник не найден")
+        await message.answer("❌ Сотрудник не найден")
         return
     
-    emp_tg_id = emp["telegram_id"]
-    emp_name = emp["full_name"]
+    # Сохраняем ID сотрудника
+    user_state[uid] = f"edit_shift_list:{emp['telegram_id']}:{emp['full_name']}"
     
-    shifts = await db.get_employee_shifts_recent(emp_tg_id, 14)
+    # Получаем смены за последние 14 дней
+    shifts = await db.get_employee_shifts_recent(emp["telegram_id"], 14)
     
     if not shifts:
-        await message.answer(f"У {emp_name} нет смен за последние 14 дней")
+        await message.answer(f"📭 У {emp['full_name']} нет смен за последние 14 дней.\n\nНажмите «🔙 Назад» чтобы выбрать другого сотрудника")
         return
     
-    shift_buttons = []
+    # Показываем список смен в виде текста + просим ввести ID
+    shifts_text = f"📋 *Смены сотрудника {emp['full_name']}:*\n\n"
     for s in shifts:
-        status = "🔴" if s["closed_at"] else "🟢"
-        date_str = fmt_datetime(s["opened_at"])[:16]
-        shift_buttons.append([KeyboardButton(text=f"{status} #{s['id']} | {date_str}")])
+        status = "🟢 АКТИВНА" if not s["closed_at"] else "🔴 ЗАКРЫТА"
+        time_str = fmt_datetime(s["opened_at"])
+        shifts_text += f"`#{s['id']}` — {status}\n   🕐 Открыта: {time_str}\n"
+        if s["closed_at"]:
+            shifts_text += f"   🕐 Закрыта: {fmt_datetime(s['closed_at'])}\n"
+        shifts_text += f"   ⏱ Длительность: {fmt_duration(s.get('duration_minutes', 0))}\n\n"
     
-    kb = ReplyKeyboardMarkup(
-        keyboard=shift_buttons + [[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
+    await message.answer(
+        f"{shifts_text}\n"
+        f"✏️ Введите ID смены (число после #), которую хотите отредактировать:\n\n"
+        f"Например: `123`",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
     )
-    user_state[uid] = f"edit_shift_select_shift:{emp_tg_id}:{emp_name}"
-    await message.answer(f"👤 *{emp_name}*\n\nВыберите смену для редактирования:", parse_mode="Markdown", reply_markup=kb)
+    
+    # Переходим в состояние ожидания ID смены
+    user_state[uid] = f"edit_shift_wait_id:{emp['telegram_id']}:{emp['full_name']}"
 
 
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_select_shift:"))
-async def edit_shift_choose_action(message: Message):
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_wait_id:"))
+async def edit_shift_get_id(message: Message):
     uid = message.from_user.id
-    text = message.text.strip()
+    parts = user_state[uid].split(":")
+    emp_tg_id = int(parts[1])
+    emp_name = parts[2]
     
-    if text == "🔙 Назад":
+    shift_id_text = message.text.strip()
+    
+    if shift_id_text == "❌ Отмена":
         del user_state[uid]
-        await message.answer("⚙️ Админ-панель", reply_markup=admin_panel_kb())
+        await message.answer("❌ Отменено", reply_markup=admin_panel_kb())
         return
     
-    match = re.search(r'#(\d+)', text)
-    if not match:
-        await message.answer("❗ Не удалось определить смену. Нажмите на кнопку смены.")
+    try:
+        shift_id = int(shift_id_text)
+    except ValueError:
+        await message.answer("❌ Введите число — ID смены (например: 123)\n\nНажмите «❌ Отмена» для выхода")
         return
-    
-    shift_id = int(match.group(1))
     
     shift = await db.get_shift_by_id(shift_id)
-    if not shift:
-        await message.answer("Смена не найдена")
+    if not shift or shift["telegram_id"] != emp_tg_id:
+        await message.answer(f"❌ Смена #{shift_id} не найдена у сотрудника {emp_name}\n\nПроверьте ID и попробуйте снова")
         return
     
-    parts = user_state[uid].split(":")
-    emp_name = parts[2] if len(parts) > 2 else "сотрудник"
-    
-    user_state[uid] = f"edit_shift_action:{shift_id}:{shift['telegram_id']}"
+    # Сохраняем ID смены и показываем меню действий
+    user_state[uid] = f"edit_shift_action:{shift_id}:{emp_tg_id}:{emp_name}"
     
     action_kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -843,32 +854,73 @@ async def edit_shift_choose_action(message: Message):
         f"🔴 Закрыта: {fmt_datetime(shift['closed_at']) if shift['closed_at'] else '—'}\n"
         f"📊 Статус: {status}\n"
         f"⏱ Длительность: {duration}\n\n"
-        f"Что хотите изменить?",
+        f"Что хотите сделать?",
         parse_mode="Markdown",
         reply_markup=action_kb
     )
 
 
 @router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_action:") and m.text == "⏰ Изменить время начала")
-async def edit_shift_change_start(message: Message):
+async def edit_shift_change_start_time(message: Message):
     uid = message.from_user.id
-    user_state[uid] = user_state[uid] + ":change_start"
+    parts = user_state[uid].split(":")
+    shift_id = int(parts[1])
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
+    
+    user_state[uid] = f"edit_shift_start_new:{shift_id}:{emp_tg_id}:{emp_name}"
     await message.answer(
-        "⏰ Введите новое время начала смены в формате:\n\n"
-        "`2025-01-15 09:00:00`\n\n"
-        "Или *относительно*: `+2 часа`, `-30 минут`\n\n"
-        "Затем укажите причину изменения.",
+        "⏰ Введите *НОВОЕ ВРЕМЯ НАЧАЛА* смены:\n\n"
+        "Варианты:\n"
+        "• `2025-01-15 09:00:00` — абсолютное время\n"
+        "• `+2 часа` — сдвинуть на 2 часа вперёд\n"
+        "• `-30 минут` — сдвинуть назад\n\n"
+        "Затем я спрошу причину изменения.",
         parse_mode="Markdown",
         reply_markup=cancel_kb()
     )
 
 
-@router.message(lambda m: user_state.get(m.from_user.id, "").endswith("change_start"))
-async def edit_shift_save_start(message: Message, bot: Bot):
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_start_new:"))
+async def edit_shift_save_start_time(message: Message):
     uid = message.from_user.id
     parts = user_state[uid].split(":")
     shift_id = int(parts[1])
-    emp_tg_id = int(parts[2]) if len(parts) > 2 else None
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
+    
+    time_value = message.text.strip()
+    
+    if time_value == "❌ Отмена":
+        del user_state[uid]
+        await message.answer("❌ Отменено", reply_markup=admin_panel_kb())
+        return
+    
+    # Сохраняем новое время и ждём причину
+    user_state[uid] = f"edit_shift_start_reason:{shift_id}:{emp_tg_id}:{emp_name}:{time_value}"
+    await message.answer(
+        "📝 Укажите *ПРИЧИНУ* изменения времени начала смены:\n\n"
+        "Например: «Ошибка при открытии», «Сотрудник задержался» и т.д.",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
+    )
+
+
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_start_reason:"))
+async def edit_shift_apply_start_time(message: Message, bot: Bot):
+    uid = message.from_user.id
+    reason = message.text.strip()
+    
+    if reason == "❌ Отмена":
+        del user_state[uid]
+        await message.answer("❌ Отменено", reply_markup=admin_panel_kb())
+        return
+    
+    parts = user_state[uid].split(":")
+    shift_id = int(parts[1])
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
+    time_value = parts[4]
     
     shift = await db.get_shift_by_id(shift_id)
     if not shift:
@@ -876,86 +928,113 @@ async def edit_shift_save_start(message: Message, bot: Bot):
         del user_state[uid]
         return
     
-    user_state[uid] = f"edit_shift_reason:{shift_id}:{emp_tg_id}:start:{shift['opened_at']}:{message.text}"
-    await message.answer("📝 Укажите причину изменения времени начала:", reply_markup=cancel_kb())
-
-
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_reason:") and "start" in user_state.get(m.from_user.id, ""))
-async def edit_shift_save_start_reason(message: Message, bot: Bot):
-    uid = message.from_user.id
-    reason = message.text.strip()
-    parts = user_state[uid].split(":")
-    shift_id = int(parts[1])
-    emp_tg_id = int(parts[2])
-    old_time = parts[4]
-    new_time_raw = parts[5]
+    old_time = shift["opened_at"]
     
     try:
-        new_time = await parse_time_change(new_time_raw, old_time)
-        if new_time is None:
-            await message.answer("❗ Время не может быть пустым")
-            return
+        # Парсим время
+        if time_value.startswith("+") or time_value.startswith("-") or "час" in time_value or "минут" in time_value:
+            # Относительное время
+            import re
+            match = re.match(r"([+-]?\d+)\s*(час|часа|часов|ч|минут|минуты|минуту|мин|м)", time_value.lower())
+            if match:
+                num = int(match.group(1))
+                unit = match.group(2)
+                current = datetime.strptime(old_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+                if unit in ["час", "часа", "часов", "ч"]:
+                    new_time = current + timedelta(hours=num)
+                else:
+                    new_time = current + timedelta(minutes=num)
+                new_time_str = new_time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                raise ValueError("Неверный формат")
+        else:
+            # Абсолютное время
+            new_time = datetime.strptime(time_value, "%Y-%m-%d %H:%M:%S")
+            new_time_str = new_time.strftime("%Y-%m-%d %H:%M:%S")
         
-        await db.update_shift_start(shift_id, new_time.strftime("%Y-%m-%d %H:%M:%S"))
+        await db.update_shift_start(shift_id, new_time_str)
         
+        # Логируем
         admin = await db.get_employee(uid)
         admin_name = admin["full_name"] if admin else str(uid)
-        emp = await db.get_employee(emp_tg_id) if emp_tg_id else None
-        emp_name = emp["full_name"] if emp else "сотрудник"
-        
-        await log_edit(uid, admin_name, "Изменение времени начала смены", emp_tg_id, emp_name, old_time, new_time.strftime("%Y-%m-%d %H:%M:%S"), reason)
+        await db.add_edit_log(uid, admin_name, "Изменение времени начала смены", emp_tg_id, emp_name, old_time, new_time_str, reason)
         
         del user_state[uid]
-        await message.answer(f"✅ Время начала смены #{shift_id} изменено с {fmt_datetime(old_time)} на {fmt_datetime(new_time.strftime('%Y-%m-%d %H:%M:%S'))}", reply_markup=admin_panel_kb())
-        await notify_admins(bot, f"✏️ *Изменение времени начала смены*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n⏰ {fmt_datetime(old_time)} → {fmt_datetime(new_time.strftime('%Y-%m-%d %H:%M:%S'))}\n📝 Причина: {reason}")
+        await message.answer(
+            f"✅ Время начала смены *#{shift_id}* изменено!\n\n"
+            f"🕐 Было: {fmt_datetime(old_time)}\n"
+            f"🕐 Стало: {fmt_datetime(new_time_str)}\n"
+            f"📝 Причина: {reason}",
+            parse_mode="Markdown",
+            reply_markup=admin_panel_kb()
+        )
+        await notify_admins(bot, f"✏️ *Изменение времени начала смены*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n⏰ {fmt_datetime(old_time)} → {fmt_datetime(new_time_str)}\n📝 Причина: {reason}")
         
-    except ValueError as e:
-        await message.answer(f"❌ {str(e)}", parse_mode="Markdown")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}\n\nПример: `2025-01-15 09:00:00` или `+2 часа`", parse_mode="Markdown")
 
 
 @router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_action:") and m.text == "🔴 Изменить время окончания")
-async def edit_shift_change_end(message: Message):
+async def edit_shift_change_end_time(message: Message):
     uid = message.from_user.id
-    user_state[uid] = user_state[uid] + ":change_end"
+    parts = user_state[uid].split(":")
+    shift_id = int(parts[1])
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
+    
+    user_state[uid] = f"edit_shift_end_new:{shift_id}:{emp_tg_id}:{emp_name}"
     await message.answer(
-        "🔴 Введите новое время окончания смены в формате:\n\n"
-        "`2025-01-15 18:00:00`\n\n"
-        "Или *относительно*: `+2 часа`, `-30 минут`\n\n"
-        "*Пустое значение* — сделать смену активной (открытой)\n\n"
-        "Затем укажите причину изменения.",
+        "🔴 Введите *НОВОЕ ВРЕМЯ ОКОНЧАНИЯ* смены:\n\n"
+        "Варианты:\n"
+        "• `2025-01-15 18:00:00` — абсолютное время\n"
+        "• `+2 часа` — сдвинуть на 2 часа вперёд\n"
+        "• `-30 минут` — сдвинуть назад\n"
+        "• `оставить пустым` — сделать смену активной (открытой)\n\n"
+        "Затем я спрошу причину изменения.",
         parse_mode="Markdown",
         reply_markup=cancel_kb()
     )
 
 
-@router.message(lambda m: user_state.get(m.from_user.id, "").endswith("change_end"))
-async def edit_shift_save_end(message: Message, bot: Bot):
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_end_new:"))
+async def edit_shift_save_end_time(message: Message):
     uid = message.from_user.id
-    parts = user_state[uid].split(":")
-    shift_id = int(parts[1])
-    emp_tg_id = int(parts[2]) if len(parts) > 2 else None
-    
-    shift = await db.get_shift_by_id(shift_id)
-    if not shift:
-        await message.answer("❌ Смена не найдена")
-        del user_state[uid]
-        return
-    
-    user_state[uid] = f"edit_shift_reason:{shift_id}:{emp_tg_id}:end:{shift['closed_at'] if shift['closed_at'] else 'активна'}:{message.text}"
-    await message.answer("📝 Укажите причину изменения времени окончания:", reply_markup=cancel_kb())
-
-
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_reason:") and "end" in user_state.get(m.from_user.id, ""))
-async def edit_shift_save_end_reason(message: Message, bot: Bot):
-    uid = message.from_user.id
-    reason = message.text.strip()
     parts = user_state[uid].split(":")
     shift_id = int(parts[1])
     emp_tg_id = int(parts[2])
-    old_time = parts[4]
-    new_time_raw = parts[5]
+    emp_name = parts[3]
+    
+    time_value = message.text.strip()
+    
+    if time_value == "❌ Отмена":
+        del user_state[uid]
+        await message.answer("❌ Отменено", reply_markup=admin_panel_kb())
+        return
+    
+    # Сохраняем новое время и ждём причину
+    user_state[uid] = f"edit_shift_end_reason:{shift_id}:{emp_tg_id}:{emp_name}:{time_value}"
+    await message.answer(
+        "📝 Укажите *ПРИЧИНУ* изменения времени окончания смены:",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb()
+    )
+
+
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_end_reason:"))
+async def edit_shift_apply_end_time(message: Message, bot: Bot):
+    uid = message.from_user.id
+    reason = message.text.strip()
+    
+    if reason == "❌ Отмена":
+        del user_state[uid]
+        await message.answer("❌ Отменено", reply_markup=admin_panel_kb())
+        return
+    
+    parts = user_state[uid].split(":")
+    shift_id = int(parts[1])
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
+    time_value = parts[4]
     
     shift = await db.get_shift_by_id(shift_id)
     if not shift:
@@ -963,50 +1042,73 @@ async def edit_shift_save_end_reason(message: Message, bot: Bot):
         del user_state[uid]
         return
     
+    old_time = shift["closed_at"] if shift["closed_at"] else "активна"
+    
     try:
-        if new_time_raw == "":
+        if time_value == "":
+            # Делаем смену активной
             await db.update_shift_make_active(shift_id)
+            new_time_str = "активна (открыта)"
             
             admin = await db.get_employee(uid)
             admin_name = admin["full_name"] if admin else str(uid)
-            emp = await db.get_employee(emp_tg_id) if emp_tg_id else None
-            emp_name = emp["full_name"] if emp else "сотрудник"
-            
-            await log_edit(uid, admin_name, "Смена сделана активной", emp_tg_id, emp_name, old_time, "активна", reason)
+            await db.add_edit_log(uid, admin_name, "Смена сделана активной", emp_tg_id, emp_name, old_time, new_time_str, reason)
             
             del user_state[uid]
-            await message.answer(f"✅ Смена #{shift_id} теперь активна (не закрыта)", reply_markup=admin_panel_kb())
+            await message.answer(
+                f"✅ Смена *#{shift_id}* теперь активна (открыта)!\n\n"
+                f"📝 Причина: {reason}",
+                parse_mode="Markdown",
+                reply_markup=admin_panel_kb()
+            )
             await notify_admins(bot, f"✏️ *Смена сделана активной*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n📝 Причина: {reason}")
             return
         
-        base_time = shift["closed_at"] if shift["closed_at"] else shift["opened_at"]
-        new_time = await parse_time_change(new_time_raw, base_time)
-        if new_time is None:
-            await message.answer("❗ Время не может быть пустым")
-            return
+        # Парсим время
+        if time_value.startswith("+") or time_value.startswith("-") or "час" in time_value or "минут" in time_value:
+            import re
+            match = re.match(r"([+-]?\d+)\s*(час|часа|часов|ч|минут|минуты|минуту|мин|м)", time_value.lower())
+            if match:
+                num = int(match.group(1))
+                unit = match.group(2)
+                base_time = shift["closed_at"] if shift["closed_at"] else shift["opened_at"]
+                current = datetime.strptime(base_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
+                if unit in ["час", "часа", "часов", "ч"]:
+                    new_time = current + timedelta(hours=num)
+                else:
+                    new_time = current + timedelta(minutes=num)
+                new_time_str = new_time.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                raise ValueError("Неверный формат")
+        else:
+            new_time = datetime.strptime(time_value, "%Y-%m-%d %H:%M:%S")
+            new_time_str = new_time.strftime("%Y-%m-%d %H:%M:%S")
         
+        # Проверяем, чтобы время окончания было позже начала
         opened = datetime.strptime(shift["opened_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
         if new_time <= opened:
-            await message.answer("❌ Время окончания должно быть позже времени начала смены!")
+            await message.answer("❌ Время окончания должно быть ПОЗЖЕ времени начала смены!")
             return
         
-        await db.update_shift_end(shift_id, new_time.strftime("%Y-%m-%d %H:%M:%S"))
+        await db.update_shift_end(shift_id, new_time_str)
         
         admin = await db.get_employee(uid)
         admin_name = admin["full_name"] if admin else str(uid)
-        emp = await db.get_employee(emp_tg_id) if emp_tg_id else None
-        emp_name = emp["full_name"] if emp else "сотрудник"
-        
-        await log_edit(uid, admin_name, "Изменение времени окончания смены", emp_tg_id, emp_name, old_time, new_time.strftime("%Y-%m-%d %H:%M:%S"), reason)
+        await db.add_edit_log(uid, admin_name, "Изменение времени окончания смены", emp_tg_id, emp_name, old_time, new_time_str, reason)
         
         del user_state[uid]
-        await message.answer(f"✅ Время окончания смены #{shift_id} изменено на {fmt_datetime(new_time.strftime('%Y-%m-%d %H:%M:%S'))}", reply_markup=admin_panel_kb())
-        await notify_admins(bot, f"✏️ *Изменение времени окончания смены*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n🔴 {fmt_datetime(old_time) if old_time != 'активна' else 'активна'} → {fmt_datetime(new_time.strftime('%Y-%m-%d %H:%M:%S'))}\n📝 Причина: {reason}")
+        await message.answer(
+            f"✅ Время окончания смены *#{shift_id}* изменено!\n\n"
+            f"🕐 Было: {fmt_datetime(old_time) if old_time != 'активна' else 'активна'}\n"
+            f"🕐 Стало: {fmt_datetime(new_time_str)}\n"
+            f"📝 Причина: {reason}",
+            parse_mode="Markdown",
+            reply_markup=admin_panel_kb()
+        )
+        await notify_admins(bot, f"✏️ *Изменение времени окончания смены*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n⏰ {fmt_datetime(old_time) if old_time != 'активна' else 'активна'} → {fmt_datetime(new_time_str)}\n📝 Причина: {reason}")
         
-    except ValueError as e:
-        await message.answer(f"❌ {str(e)}", parse_mode="Markdown")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}\n\nПример: `2025-01-15 18:00:00` или `+2 часа` или отправьте пустое сообщение", parse_mode="Markdown")
 
 
 @router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_action:") and m.text == "🗑 Удалить смену")
@@ -1014,7 +1116,8 @@ async def edit_shift_delete_confirm(message: Message):
     uid = message.from_user.id
     parts = user_state[uid].split(":")
     shift_id = int(parts[1])
-    emp_tg_id = int(parts[2]) if len(parts) > 2 else None
+    emp_tg_id = int(parts[2])
+    emp_name = parts[3]
     
     shift = await db.get_shift_by_id(shift_id)
     if not shift:
@@ -1022,89 +1125,60 @@ async def edit_shift_delete_confirm(message: Message):
         del user_state[uid]
         return
     
-    emp = await db.get_employee(emp_tg_id) if emp_tg_id else None
-    emp_name = emp["full_name"] if emp else "сотрудник"
-    
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="✅ ДА, удалить смену")], [KeyboardButton(text="❌ Нет, отмена")]],
-        resize_keyboard=True
-    )
-    user_state[uid] = f"edit_shift_delete_confirm:{shift_id}:{emp_tg_id}"
+    user_state[uid] = f"edit_shift_delete_reason:{shift_id}:{emp_tg_id}:{emp_name}"
     await message.answer(
-        f"⚠️ *ВНИМАНИЕ!*\n\nВы действительно хотите удалить смену *#{shift_id}* у сотрудника *{emp_name}*?\n\n"
+        f"⚠️ *ВНИМАНИЕ!*\n\nВы действительно хотите удалить смену *#{shift_id}*?\n\n"
+        f"👤 Сотрудник: {emp_name}\n"
         f"🟢 Открыта: {fmt_datetime(shift['opened_at'])}\n"
         f"{'🔴 Закрыта: ' + fmt_datetime(shift['closed_at']) if shift['closed_at'] else '🟢 Активна'}\n\n"
-        f"Это действие необратимо!",
+        f"📝 Укажите *ПРИЧИНУ* удаления:",
         parse_mode="Markdown",
-        reply_markup=kb
+        reply_markup=cancel_kb()
     )
 
 
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_delete_confirm:") and m.text == "✅ ДА, удалить смену")
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_delete_reason:"))
 async def edit_shift_delete_execute(message: Message, bot: Bot):
     uid = message.from_user.id
-    parts = user_state[uid].split(":")
-    shift_id = int(parts[1])
-    emp_tg_id = int(parts[2]) if len(parts) > 2 else None
-    
-    user_state[uid] = f"edit_shift_reason:{shift_id}:{emp_tg_id}:delete"
-    await message.answer("📝 Укажите причину удаления смены:", reply_markup=cancel_kb())
-
-
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_reason:") and "delete" in user_state.get(m.from_user.id, ""))
-async def edit_shift_delete_reason(message: Message, bot: Bot):
-    uid = message.from_user.id
     reason = message.text.strip()
+    
+    if reason == "❌ Отмена":
+        del user_state[uid]
+        await message.answer("❌ Удаление отменено", reply_markup=admin_panel_kb())
+        return
+    
     parts = user_state[uid].split(":")
     shift_id = int(parts[1])
     emp_tg_id = int(parts[2])
+    emp_name = parts[3]
     
     shift = await db.get_shift_by_id(shift_id)
     if shift:
         admin = await db.get_employee(uid)
         admin_name = admin["full_name"] if admin else str(uid)
-        emp = await db.get_employee(emp_tg_id) if emp_tg_id else None
-        emp_name = emp["full_name"] if emp else "сотрудник"
         
         await db.delete_shift(shift_id)
-        await log_edit(uid, admin_name, "Удаление смены", emp_tg_id, emp_name, f"смена #{shift_id}", "удалено", reason)
+        await db.add_edit_log(uid, admin_name, "Удаление смены", emp_tg_id, emp_name, f"смена #{shift_id}", "удалено", reason)
         
         del user_state[uid]
-        await message.answer(f"✅ Смена #{shift_id} удалена", reply_markup=admin_panel_kb())
+        await message.answer(
+            f"✅ Смена *#{shift_id}* удалена!\n\n"
+            f"👤 Сотрудник: {emp_name}\n"
+            f"📝 Причина: {reason}",
+            parse_mode="Markdown",
+            reply_markup=admin_panel_kb()
+        )
         await notify_admins(bot, f"🗑 *Удаление смены*\n👤 {admin_name}\n🎯 {emp_name}\n🆔 Смена #{shift_id}\n📝 Причина: {reason}")
     else:
         del user_state[uid]
         await message.answer("❌ Смена не найдена", reply_markup=admin_panel_kb())
 
 
-@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_delete_confirm:") and m.text == "❌ Нет, отмена")
-async def edit_shift_delete_cancel(message: Message):
+@router.message(lambda m: user_state.get(m.from_user.id, "").startswith("edit_shift_action:") and m.text == "🔙 Назад")
+async def edit_shift_back_to_admin(message: Message):
     uid = message.from_user.id
     del user_state[uid]
-    await message.answer("❌ Удаление отменено", reply_markup=admin_panel_kb())
-
-
-async def parse_time_change(value: str, current_time: str):
-    if not value or value.strip() == "":
-        return None
-    
-    try:
-        return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
-    except:
-        pass
-    
-    match = re.match(r"([+-]?\d+)\s*(час|часа|часов|ч|минут|минуты|минуту|мин|м|hour|h|minute|min)", value.lower())
-    if match:
-        num = int(match.group(1))
-        unit = match.group(2)
-        current = datetime.strptime(current_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=MSK)
-        
-        if unit in ["час", "часа", "часов", "ч", "hour", "h"]:
-            return current + timedelta(hours=num)
-        else:
-            return current + timedelta(minutes=num)
-    
-    raise ValueError("Неверный формат времени. Используйте: 2025-01-15 09:00:00 или +2 часа")
+    await message.answer("⚙️ Админ-панель", reply_markup=admin_panel_kb())
 
 
 # ---------- Открыть смену ----------
