@@ -95,6 +95,22 @@ async def init_db():
             )
         """)
         
+        # Таблица истории правок
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS edit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                admin_name TEXT,
+                edit_type TEXT,
+                target_id INTEGER,
+                target_name TEXT,
+                old_value TEXT,
+                new_value TEXT,
+                reason TEXT,
+                created_at TEXT DEFAULT (datetime('now', '+3 hours'))
+            )
+        """)
+        
         await db.commit()
         
         # Дефолтные настройки
@@ -297,7 +313,7 @@ async def get_shifts_this_week(telegram_id: int):
             return await cur.fetchall()
 
 
-async def get_employee_shifts_recent(telegram_id: int, days: int = 7):
+async def get_employee_shifts_recent(telegram_id: int, days: int = 14):
     """Получить смены сотрудника за последние N дней"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -493,6 +509,30 @@ async def log_notification(telegram_id: int, notif_type: str, message: str):
             (telegram_id, notif_type, message)
         )
         await db.commit()
+
+
+# ========== ИСТОРИЯ РЕДАКТИРОВАНИЙ ==========
+
+async def add_edit_log(admin_id: int, admin_name: str, edit_type: str, target_id: int, target_name: str, old_value: str, new_value: str, reason: str):
+    """Добавить запись о редактировании в лог"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO edit_logs (admin_id, admin_name, edit_type, target_id, target_name, old_value, new_value, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (admin_id, admin_name, edit_type, target_id, target_name, old_value, new_value, reason))
+        await db.commit()
+
+
+async def get_edit_logs(limit: int = 50):
+    """Получить последние записи о редактированиях"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM edit_logs 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        """, (limit,)) as cur:
+            return await cur.fetchall()
 
 
 # ========== НАСТРОЙКИ ==========
